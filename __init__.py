@@ -52,6 +52,27 @@ class QQStreamingAdapter(QQAdapter):
         self._stream_indices: Dict[str, int] = {}
         self._stream_sent_text: Dict[str, str] = {}
         self._finalized_streams: Dict[str, str] = {}
+        # Immutable request identity and mutable progress keyed by QQ's stream
+        # id.  Chat-level fields are only the pending first-frame state; once a
+        # stream exists, later inbound messages for the same chat must not
+        # retarget the older consumer to the newer msg_id/msg_seq.
+        self._stream_requests: Dict[str, tuple[str, int]] = {}
+        self._stream_progress: Dict[str, tuple[str, int]] = {}
+        self._stream_aliases: Dict[str, str] = {}
+
+    def _latest_stream_id(self, stream_id: str) -> str:
+        """Resolve response-id rotations while tolerating stale consumer ids."""
+        seen: set[str] = set()
+        current = stream_id
+        while current in self._stream_aliases and current not in seen:
+            seen.add(current)
+            current = self._stream_aliases[current]
+        return current
+
+    def _remember_stream_alias(self, old_id: str, latest_id: str) -> None:
+        self._stream_aliases[old_id] = latest_id
+        while len(self._stream_aliases) > 4096:
+            self._stream_aliases.pop(next(iter(self._stream_aliases)))
 
     def supports_draft_streaming(
         self,
@@ -82,11 +103,17 @@ class QQStreamingAdapter(QQAdapter):
         return content
 
     def _frame_content(
-        self, chat_id: str, content: str, *, finalize: bool
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        finalize: bool,
+        previous: Optional[str] = None,
     ) -> str:
         """Build an append-only QQ frame while buffering Hermes' mutable tail."""
         content = self._stable_stream_content(content)
-        previous = self._stream_sent_text.get(chat_id, "")
+        if previous is None:
+            previous = self._stream_sent_text.get(chat_id, "")
         if finalize:
             candidate = content
         else:
@@ -249,6 +276,11 @@ class QQStreamingAdapter(QQAdapter):
         self._active_streams[chat_id] = str(returned_id)
         self._stream_sent_text[chat_id] = content
         self._stream_indices[chat_id] = current_index + 1
+        self._stream_requests[str(returned_id)] = (
+            msg_id,
+            self._stream_msg_seqs.get(chat_id, 0),
+        )
+        self._stream_progress[str(returned_id)] = (content, current_index + 1)
         logger.info(
             "[%s] QQ stream frame accepted: index=%d state=1 prior_len=%d "
             "current_len=%d response_id=%s remain_msg_len=%s",
@@ -275,6 +307,9 @@ class QQStreamingAdapter(QQAdapter):
         if not self.is_connected:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        requested_message_id = message_id
+        message_id = self._latest_stream_id(message_id)
+
         # GatewayStreamConsumer currently makes a second identical finalize
         # call for REQUIRES_EDIT_FINALIZE adapters.  The first one already sent
         # input_state=10 to QQ; acknowledge the redundant call locally instead
@@ -282,12 +317,27 @@ class QQStreamingAdapter(QQAdapter):
         if finalize and self._finalized_streams.get(chat_id) == message_id:
             return SendResult(success=True, message_id=message_id)
 
-        msg_id = self._stream_msg_ids.get(chat_id)
-        if not msg_id:
+        request = self._stream_requests.get(message_id)
+        if request is None:
+            pending_msg_id = self._stream_msg_ids.get(chat_id)
+            if pending_msg_id:
+                request = (
+                    pending_msg_id,
+                    self._stream_msg_seqs.get(chat_id, 0),
+                )
+        if request is None:
             return SendResult(success=False, error="Missing QQ streaming request state")
+        msg_id, msg_seq = request
 
-        content = self._frame_content(chat_id, content, finalize=finalize)
-        previous = self._stream_sent_text.get(chat_id, "")
+        stream_progress = self._stream_progress.get(message_id)
+        previous = (
+            stream_progress[0]
+            if stream_progress is not None
+            else self._stream_sent_text.get(chat_id, "")
+        )
+        content = self._frame_content(
+            chat_id, content, finalize=finalize, previous=previous
+        )
 
         if previous and not content.startswith(previous):
             logger.error(
@@ -305,10 +355,14 @@ class QQStreamingAdapter(QQAdapter):
         if not finalize and content == previous:
             return SendResult(success=True, message_id=message_id)
 
-        current_index = self._stream_indices.get(chat_id, 0)
+        current_index = (
+            stream_progress[1]
+            if stream_progress is not None
+            else self._stream_indices.get(chat_id, 0)
+        )
         body = {
             "msg_id": msg_id,
-            "msg_seq": self._stream_msg_seqs.get(chat_id, 0),
+            "msg_seq": msg_seq,
             "index": current_index,
             "content_raw": content,
             "content_type": self._STREAM_CONTENT_TYPE_MARKDOWN,
@@ -355,18 +409,36 @@ class QQStreamingAdapter(QQAdapter):
                 response_id,
                 current_index,
             )
-        self._stream_indices[chat_id] = current_index + 1
-        self._stream_sent_text[chat_id] = content
+            self._remember_stream_alias(message_id, response_id)
+            self._remember_stream_alias(requested_message_id, response_id)
+        owns_chat_state = self._active_streams.get(chat_id) == message_id
+        self._stream_requests.pop(message_id, None)
+        self._stream_progress.pop(message_id, None)
+        self._stream_requests[response_id] = request
+        self._stream_progress[response_id] = (content, current_index + 1)
+        if owns_chat_state:
+            self._active_streams[chat_id] = response_id
+            self._stream_indices[chat_id] = current_index + 1
+            self._stream_sent_text[chat_id] = content
         if finalize:
-            self._finalized_streams[chat_id] = message_id
-            self._active_streams.pop(chat_id, None)
-            # Hermes may continue with an overflow tail after sealing a message
-            # near the platform limit.  That tail is a new bubble/new stream,
-            # so it must start at index 0 with no inherited full-text prefix.
-            self._stream_sent_text.pop(chat_id, None)
-            self._stream_indices.pop(chat_id, None)
+            self._finalized_streams[chat_id] = response_id
+            self._stream_requests.pop(response_id, None)
+            self._stream_progress.pop(response_id, None)
+            if owns_chat_state:
+                self._active_streams.pop(chat_id, None)
+                # Hermes may continue with an overflow tail after sealing a
+                # message near the platform limit. That tail is a new stream.
+                self._stream_sent_text.pop(chat_id, None)
+                self._stream_indices.pop(chat_id, None)
+            # Restore the normal 4000-char budget only if this finalized stream
+            # still belongs to the current inbound request.  A newer overlapping
+            # request for the same chat owns these pending fields and must remain.
+            if self._stream_msg_ids.get(chat_id) == msg_id:
+                self._stream_event_ids.pop(chat_id, None)
+                self._stream_msg_ids.pop(chat_id, None)
+                self._stream_msg_seqs.pop(chat_id, None)
         return SendResult(
-            success=True, message_id=message_id, raw_response=data
+            success=True, message_id=response_id, raw_response=data
         )
 
     def store_stream_event_id(self, chat_id: str, event_id: str) -> None:

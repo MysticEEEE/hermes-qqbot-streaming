@@ -19,6 +19,9 @@ def make_adapter():
     adapter._stream_indices = {}
     adapter._stream_sent_text = {}
     adapter._finalized_streams = {}
+    adapter._stream_requests = {}
+    adapter._stream_progress = {}
+    adapter._stream_aliases = {}
     adapter._api_request = AsyncMock(return_value={"id": "stream-1"})
     return adapter
 
@@ -200,6 +203,8 @@ async def test_finalize_marks_done_and_cleans_all_turn_state():
     assert body["stream_msg_id"] == "stream-1"
     assert "user-1" not in adapter._active_streams
     assert adapter._finalized_streams["user-1"] == "stream-1"
+    assert "user-1" not in adapter._stream_msg_ids
+    assert adapter.max_message_length_for_chat("user-1") == 4000
 
     # Consumer's redundant second finalize is acknowledged without a second
     # QQ API request, so the same bubble closes exactly once.
@@ -209,6 +214,174 @@ async def test_finalize_marks_done_and_cleans_all_turn_state():
     )
     assert duplicate.success is True
     adapter._api_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_each_edit_adopts_latest_response_stream_id():
+    """The next fragment must use the id returned by the previous fragment."""
+    adapter = make_adapter()
+    adapter._stream_msg_ids["user-1"] = "msg-1"
+    adapter._stream_msg_seqs["user-1"] = 7
+    adapter._active_streams["user-1"] = "stream-1"
+    adapter._stream_requests["stream-1"] = ("msg-1", 7)
+    adapter._stream_sent_text["user-1"] = "H"
+    adapter._stream_indices["user-1"] = 1
+    adapter._api_request.side_effect = [
+        {"id": "stream-2"},
+        {"id": "stream-3"},
+    ]
+    long_text = "Hello " + ("x" * 140)
+
+    first = await adapter.edit_message(
+        "user-1", "stream-1", long_text, finalize=False
+    )
+    assert first.message_id == "stream-2"
+    assert adapter._active_streams["user-1"] == "stream-2"
+
+    second = await adapter.edit_message(
+        "user-1", first.message_id, long_text + " done", finalize=True
+    )
+    bodies = [call.args[2] for call in adapter._api_request.await_args_list]
+    assert bodies[0]["stream_msg_id"] == "stream-1"
+    assert bodies[1]["stream_msg_id"] == "stream-2"
+    assert second.message_id == "stream-3"
+
+
+@pytest.mark.asyncio
+async def test_consumer_old_id_is_resolved_to_latest_response_id():
+    adapter = make_adapter()
+    adapter._stream_msg_ids["user-1"] = "msg-1"
+    adapter._stream_msg_seqs["user-1"] = 7
+    adapter._api_request.side_effect = [
+        {"id": "stream-1"},
+        {"id": "stream-2"},
+        {"id": "stream-3"},
+    ]
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "user-1",
+        StreamConsumerConfig(transport="draft", chat_type="dm", cursor=" ▉"),
+    )
+    frame1 = "A" * 140
+    frame2 = "A" * 160
+    final = "A" * 180
+
+    assert await consumer._send_or_edit(frame1 + " ▉") is True
+    assert consumer.message_id == "stream-1"
+    assert await consumer._send_or_edit(frame2 + " ▉") is True
+    # GatewayStreamConsumer retains its original id after a normal edit.
+    assert consumer.message_id == "stream-1"
+    assert await consumer._send_or_edit(final, finalize=True) is True
+
+    bodies = [call.args[2] for call in adapter._api_request.await_args_list]
+    assert bodies[1]["stream_msg_id"] == "stream-1"
+    assert bodies[2]["stream_msg_id"] == "stream-2"
+    calls_after_final = adapter._api_request.await_count
+    duplicate = await adapter.edit_message(
+        "user-1", "stream-1", final, finalize=True
+    )
+    assert duplicate.success is True
+    assert duplicate.message_id == "stream-3"
+    assert adapter._api_request.await_count == calls_after_final
+
+
+def test_stream_alias_cache_is_bounded_after_insert():
+    adapter = make_adapter()
+    adapter._stream_aliases = {
+        f"old-{index}": f"latest-{index}" for index in range(4096)
+    }
+
+    adapter._remember_stream_alias("old-new", "latest-new")
+
+    assert len(adapter._stream_aliases) == 4096
+    assert adapter._stream_aliases["old-new"] == "latest-new"
+    assert "old-0" not in adapter._stream_aliases
+
+
+@pytest.mark.asyncio
+async def test_old_stream_keeps_request_snapshot_after_new_c2c_intake():
+    """A newer inbound message must not retarget an older stream's fragments."""
+    adapter = make_adapter()
+    adapter._stream_msg_ids["user-1"] = "old-msg"
+    adapter._stream_msg_seqs["user-1"] = 3
+    adapter._active_streams["user-1"] = "old-stream"
+    adapter._stream_requests["old-stream"] = ("old-msg", 3)
+    adapter._stream_sent_text["user-1"] = "H"
+    adapter._stream_indices["user-1"] = 1
+    adapter._next_msg_seq = lambda _msg_id: 8
+
+    with patch.object(plugin.QQAdapter, "_handle_c2c_message", new=AsyncMock()):
+        await adapter._handle_c2c_message(
+            {"event_id": "new-event"},
+            "new-msg",
+            "new question",
+            {"user_openid": "user-1"},
+            "2026-08-13T00:00:00+08:00",
+        )
+
+    result = await adapter.edit_message(
+        "user-1", "old-stream", "Hello " + ("x" * 140), finalize=False
+    )
+    assert result.success is True
+    body = adapter._api_request.await_args.args[2]
+    assert body["msg_id"] == "old-msg"
+    assert body["msg_seq"] == 3
+
+
+@pytest.mark.asyncio
+async def test_old_stream_holdback_uses_its_own_acknowledged_prefix():
+    adapter = make_adapter()
+    adapter._stream_msg_ids["user-1"] = "new-msg"
+    adapter._stream_msg_seqs["user-1"] = 8
+    adapter._active_streams["user-1"] = "new-stream"
+    adapter._stream_requests["old-stream"] = ("old-msg", 3)
+    adapter._stream_progress["old-stream"] = ("Old", 2)
+    adapter._stream_sent_text["user-1"] = "New"
+    adapter._stream_indices["user-1"] = 4
+    old_frame = "Old continuation " + ("x" * 140)
+
+    result = await adapter.edit_message(
+        "user-1", "old-stream", old_frame, finalize=False
+    )
+
+    assert result.success is True
+    body = adapter._api_request.await_args.args[2]
+    assert body["content_raw"].startswith("Old")
+    assert not body["content_raw"].startswith("New")
+
+
+@pytest.mark.asyncio
+async def test_old_stream_finalize_does_not_clear_new_stream_progress():
+    adapter = make_adapter()
+    adapter._stream_msg_ids["user-1"] = "new-msg"
+    adapter._stream_msg_seqs["user-1"] = 8
+    adapter._active_streams["user-1"] = "new-stream"
+    adapter._stream_requests.update(
+        {
+            "old-stream": ("old-msg", 3),
+            "new-stream": ("new-msg", 8),
+        }
+    )
+    adapter._stream_progress.update(
+        {
+            "old-stream": ("Old", 2),
+            "new-stream": ("New", 4),
+        }
+    )
+    adapter._stream_sent_text["user-1"] = "New"
+    adapter._stream_indices["user-1"] = 4
+    adapter._api_request.return_value = {"id": "old-stream"}
+
+    result = await adapter.edit_message(
+        "user-1", "old-stream", "Old complete", finalize=True
+    )
+
+    assert result.success is True
+    assert adapter._active_streams["user-1"] == "new-stream"
+    assert adapter._stream_sent_text["user-1"] == "New"
+    assert adapter._stream_indices["user-1"] == 4
+    assert adapter._stream_msg_ids["user-1"] == "new-msg"
+    assert adapter._stream_progress["new-stream"] == ("New", 4)
 
 
 @pytest.mark.asyncio
@@ -347,10 +520,9 @@ async def test_consumer_tracks_exact_qq_prefix_when_final_edit_fails():
 
 
 @pytest.mark.asyncio
-async def test_post_limit_tail_starts_fresh_stream_without_repeating_head():
-    """A consumer overflow split must start a new stream for only its tail."""
+async def test_post_limit_tail_uses_builtin_send_without_repeating_head():
+    """After a sealed stream, overflow tail uses normal QQ delivery."""
     adapter = make_adapter()
-    adapter._stream_event_ids["user-1"] = "event-1"
     adapter._stream_msg_ids["user-1"] = "msg-1"
     adapter._stream_msg_seqs["user-1"] = 7
     adapter._active_streams["user-1"] = "stream-head"
@@ -361,15 +533,17 @@ async def test_post_limit_tail_starts_fresh_stream_without_repeating_head():
         "user-1", "stream-head", "H" * 3879, finalize=True
     )
     assert sealed.success is True
-    adapter._api_request.reset_mock()
 
     tail = "T" * 254
-    fresh = await adapter.send(
-        "user-1", tail, metadata={"expect_edits": True}
+    expected = plugin.SendResult(success=True, message_id="normal-tail")
+    with patch.object(
+        plugin.QQAdapter, "send", new=AsyncMock(return_value=expected)
+    ) as parent:
+        delivered = await adapter.send(
+            "user-1", tail, metadata={"expect_edits": True}
+        )
+
+    assert delivered is expected
+    parent.assert_awaited_once_with(
+        "user-1", tail, reply_to=None, metadata={"expect_edits": True}
     )
-    assert fresh.success is True
-    body = adapter._api_request.await_args.args[2]
-    assert tail.startswith(body["content_raw"])
-    assert "H" not in body["content_raw"]
-    assert body["index"] == 0
-    assert "stream_msg_id" not in body

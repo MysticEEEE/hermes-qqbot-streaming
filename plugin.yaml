@@ -1,7 +1,7 @@
 name: qqbot-streaming
 label: QQ Bot C2C Streaming
 kind: platform
-version: 0.6.0-beta.1
+version: 0.6.0-beta.2
 description: "Override Hermes QQ Bot with official C2C stream_messages streaming"
 author: mystice
 requires_env:

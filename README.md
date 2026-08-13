@@ -52,7 +52,7 @@ hermes plugins list
 应看到：
 
 ```text
-qqbot-streaming  enabled  0.6.0-beta.1
+qqbot-streaming  enabled  0.6.0-beta.2
 ```
 
 ## 配置
@@ -90,9 +90,9 @@ python -m pytest -q
 
 ## 实测范围
 
-`v0.6.0-beta.1` 已完成：
+`v0.6.0-beta.2` 已完成：
 
-- 15 项自动化测试
+- 21 项自动化测试
 - 约 1000 字 Markdown 富文本单气泡流式
 - 约 3200–3500 字纯文本单气泡流式
 - 两次约 4900–5000 字 C2C 长文本单气泡流式

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0-beta.2 — 2026-08-13
+
+### Fixed
+
+- Adopt each fragment response's latest `stream_msg_id` for the next request, including when Hermes keeps passing the original ID
+- Bind `msg_id`, `msg_seq`, `index`, and acknowledged text to each stream so overlapping C2C turns cannot retarget one another
+- Restore the built-in 4000-character budget after a C2C stream completes
+- Preserve a newer stream's progress when an older overlapping stream finalizes
+- Route post-limit overflow tails through the built-in normal-send path
+
+### Verification
+
+- 21 automated regression and integration tests
+
 ## 0.6.0-beta.1 — 2026-08-13
 
 Initial public beta.

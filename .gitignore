@@ -7,3 +7,4 @@ htmlcov/
 .env
 *.log
 .release-notes.md
+.release-notes-beta2.md
