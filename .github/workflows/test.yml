@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Clone compatible Hermes Agent source
+        run: |
+          git clone https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout a871948
+      - name: Install Hermes and test dependencies
+        run: python -m pip install -e "$RUNNER_TEMP/hermes-agent" pytest pytest-asyncio
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ runner.temp }}/hermes-agent
+        run: python -m pytest -q
