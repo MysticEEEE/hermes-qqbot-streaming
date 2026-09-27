@@ -25,7 +25,11 @@
 - 47 passing automated tests with the companion Hermes core lifecycle patch, including real `GatewayStreamConsumer.run()` coverage for final delivery, approval, clarify/reopen, Guild DM, failure close, and opened-stream overflow lifecycles
 - On unpatched Hermes `d0288be5`, 44 tests pass and three strict xfails document the native tool-progress opt-out plus cancel/stale cleanup gaps
 - Verified against Hermes `d0288be5b3330d2442e3907185b8e9d0958297bb`
-- Passed a 2026-09-27 desktop QQ C2C visual test: one progressively growing reply bubble, no repeated body, no duplicate final send, and no residual cursor or loading animation
+- Passed 2026-09-27 desktop QQ C2C visual tests for tool-boundary replies and rich Markdown: one progressively growing reply bubble, no repeated body, no duplicate final send, and no residual cursor or loading animation
+
+### Known Limitations
+
+- A 2026-09-27 desktop QQ C2C visual test of a ~5000-character reply split into a second bubble partway through delivery. No fallback, prefix-divergence, overflow, or error log line was recorded for that turn — plugin-side accounting shows a single clean stream. This points to QQ's own client/server behavior on long single-stream content rather than a plugin defect, but the exact length threshold and trigger condition are not yet confirmed.
 
 ## 0.6.0-beta.2 — 2026-08-13
 
