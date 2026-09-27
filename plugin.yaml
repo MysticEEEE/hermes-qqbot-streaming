@@ -1,9 +1,9 @@
 name: qqbot-streaming
 label: QQ Bot C2C Streaming
 kind: platform
-version: 0.6.0-beta.2
+version: 0.6.0-beta.3
 description: "Override Hermes QQ Bot with official C2C stream_messages streaming"
-author: mystice
+author: MysticEEEE
 requires_env:
   - name: QQ_APP_ID
     description: "QQ Bot App ID"
