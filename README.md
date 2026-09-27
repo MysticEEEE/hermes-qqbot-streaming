@@ -20,7 +20,7 @@
 - 一个已经启用 QQ Bot 的 Hermes Agent 安装
 - `QQ_APP_ID`
 - `QQ_CLIENT_SECRET`
-- Python 3.11+
+- Python 3.14（与当前验证的 Hermes `d0288be5` 安装一致）
 
 本插件已在 Hermes commit `d0288be5b3330d2442e3907185b8e9d0958297bb` 上验证，并使用其 `SUPPORTS_NATIVE_STREAMING` / `send_stream_frame` contract。它继承 Hermes 内置 `gateway.platforms.qqbot.adapter.QQAdapter`，因此不是独立 QQ Bot SDK。
 
